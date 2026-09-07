@@ -114,3 +114,21 @@ def verify(content: bytes, signature: str, public_key: pathlib.Path = KEY_PATH) 
 
 def release_sort_key(release: dict[str, Any]) -> tuple[str, str, str]:
     return release["id"], release["version"], release["sha256"]
+
+
+def verified_payload(catalog: pathlib.Path, public_key: pathlib.Path = KEY_PATH) -> dict[str, Any]:
+    envelope = load_json(catalog)
+    validate(envelope, "signed-scanner-catalog.schema.json")
+    if envelope["keyId"] != KEY_ID:
+        raise ValueError("Catalog uses an unknown key ID.")
+    payload_bytes = base64.b64decode(envelope["payload"], validate=True)
+    verify(payload_bytes, envelope["signature"], public_key)
+    payload = json.loads(payload_bytes)
+    validate(payload, "scanner-catalog.schema.json")
+    if payload["releases"] != sorted(payload["releases"], key=release_sort_key):
+        raise ValueError("Catalog releases are not deterministically ordered.")
+    for release in payload["releases"]:
+        if release["signingKeyId"] != KEY_ID or release["capabilities"] != sorted(release["capabilities"]):
+            raise ValueError("Release key or capability ordering is invalid.")
+        verify(signing_bytes(release), release["packageSignature"], public_key)
+    return payload

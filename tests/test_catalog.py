@@ -1,6 +1,9 @@
 import argparse
+import base64
+import hashlib
 import importlib.util
 import pathlib
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -79,6 +82,77 @@ class CatalogTests(unittest.TestCase):
                 add_release.add(argparse.Namespace(
                     template=root / "archie.dotnet.json", signature=signature, payload=payload,
                     catalog_version="2026-09-04.1", generated_at="2026-09-04T00:00:00Z"))
+
+    def test_complete_signer_replaces_existing_scanner_and_only_changes_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repository = root / "catalog"
+            project_root = pathlib.Path(__file__).resolve().parents[1]
+            shutil.copytree(project_root, repository, ignore=shutil.ignore_patterns(".git", ".venv", "__pycache__"))
+
+            private_key = root / "private.pem"
+            public_key = repository / "keys" / f"{catalog_lib.KEY_ID}-public.pem"
+            subprocess.run(["openssl", "genpkey", "-algorithm", "EC", "-pkeyopt",
+                            "ec_paramgen_curve:P-256", "-out", private_key], check=True)
+            subprocess.run(["openssl", "pkey", "-in", private_key, "-pubout", "-out", public_key], check=True)
+
+            old_release = self._release("archie.dotnet")
+            signing_input = root / "old-release.bin"
+            signing_input.write_bytes(catalog_lib.signing_bytes(old_release))
+            old_release["packageSignature"] = catalog_lib.sign(private_key, signing_input)
+            payload_path = root / "payload.json"
+            catalog_lib.write_json(payload_path, {
+                "schemaVersion": "scanner-catalog/v1",
+                "catalogVersion": "2026-09-04.1",
+                "generatedAt": "2026-09-04T00:00:00Z",
+                "releases": [old_release],
+            })
+            catalog_lib.write_json(repository / "catalog.json", {
+                "schemaVersion": "signed-scanner-catalog/v1",
+                "keyId": catalog_lib.KEY_ID,
+                "payload": base64.b64encode(payload_path.read_bytes()).decode("ascii"),
+                "signature": catalog_lib.sign(private_key, payload_path),
+            })
+
+            subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repository, check=True)
+            subprocess.run(["git", "config", "user.name", "Catalog test"], cwd=repository, check=True)
+            subprocess.run(["git", "config", "user.email", "catalog-test@example.invalid"], cwd=repository, check=True)
+            subprocess.run(["git", "add", "."], cwd=repository, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "fixture"], cwd=repository, check=True)
+
+            self._package(root)
+            archive = root / "entorn-scanner-dotnet-linux-x64-1.3.0.tar.gz"
+            asset_url = (
+                "https://github.com/Entorn-dev/entorn-scanner-dotnet/releases/download/v1.3.0/"
+                + archive.name)
+            command = [
+                "bash", str(repository / "scripts" / "complete-signing.sh"),
+                "--archive", str(archive),
+                "--repository", "entorn-scanner-dotnet",
+                "--asset-url", asset_url,
+                "--name", "Entorn .NET scanner",
+                "--catalog-version", "2026-09-07.1",
+                "--generated-at", "2026-09-07T05:14:42Z",
+                "--expected-catalog-sha256", "0" * 64,
+                "--private-key", str(private_key),
+                "--replace-existing",
+            ]
+            rejected = subprocess.run(command, cwd=repository, capture_output=True, text=True)
+            self.assertNotEqual(0, rejected.returncode)
+            self.assertIn("does not match", rejected.stderr)
+            self.assertEqual("", subprocess.run(["git", "status", "--short"], cwd=repository,
+                                                check=True, capture_output=True, text=True).stdout)
+
+            command[command.index("0" * 64)] = hashlib.sha256((repository / "catalog.json").read_bytes()).hexdigest()
+            subprocess.run(command, cwd=repository, check=True)
+
+            payload = catalog_lib.verified_payload(repository / "catalog.json", public_key)
+            self.assertEqual("2026-09-07.1", payload["catalogVersion"])
+            self.assertEqual([("archie.dotnet", "1.3.0")],
+                             [(release["id"], release["version"]) for release in payload["releases"]])
+            status = subprocess.run(["git", "status", "--short"], cwd=repository,
+                                    check=True, capture_output=True, text=True).stdout
+            self.assertEqual(" M catalog.json\n", status)
 
     @staticmethod
     def _release(scanner_id: str) -> dict:

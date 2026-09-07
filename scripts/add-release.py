@@ -8,7 +8,16 @@ import pathlib
 import tarfile
 from typing import Any
 
-from catalog_lib import KEY_ID, decode_signature, load_json, release_sort_key, signing_bytes, validate, write_json
+from catalog_lib import (
+    KEY_ID,
+    decode_signature,
+    load_json,
+    release_sort_key,
+    signing_bytes,
+    validate,
+    verified_payload,
+    write_json,
+)
 
 
 def prepare(args: argparse.Namespace) -> None:
@@ -88,6 +97,19 @@ def add(args: argparse.Namespace) -> None:
     write_json(args.payload, payload)
 
 
+def base(args: argparse.Namespace) -> None:
+    payload = verified_payload(args.catalog)
+    if payload["catalogVersion"] == args.catalog_version:
+        raise ValueError("The replacement catalog version must differ from the current version.")
+    if args.replace_from_template:
+        scanner_id = load_json(args.replace_from_template)["id"]
+        payload["releases"] = [release for release in payload["releases"] if release["id"] != scanner_id]
+    payload["catalogVersion"] = args.catalog_version
+    payload["generatedAt"] = args.generated_at
+    validate(payload, "scanner-catalog.schema.json")
+    write_json(args.payload, payload)
+
+
 def envelope(args: argparse.Namespace) -> None:
     payload = args.payload.read_bytes()
     signature = args.signature.read_text(encoding="ascii").strip()
@@ -107,6 +129,13 @@ def main() -> None:
     prepare_parser.add_argument("--template", required=True, type=pathlib.Path)
     prepare_parser.add_argument("--signing-input", required=True, type=pathlib.Path)
     prepare_parser.set_defaults(function=prepare)
+    base_parser = commands.add_parser("base")
+    base_parser.add_argument("--catalog", required=True, type=pathlib.Path)
+    base_parser.add_argument("--payload", required=True, type=pathlib.Path)
+    base_parser.add_argument("--catalog-version", required=True)
+    base_parser.add_argument("--generated-at", required=True)
+    base_parser.add_argument("--replace-from-template", type=pathlib.Path)
+    base_parser.set_defaults(function=base)
     add_parser = commands.add_parser("add")
     add_parser.add_argument("--template", required=True, type=pathlib.Path)
     add_parser.add_argument("--signature", required=True, type=pathlib.Path)
